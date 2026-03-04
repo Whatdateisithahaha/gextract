@@ -1,0 +1,181 @@
+import os
+import pickle
+import random
+import sys
+from datetime import datetime
+
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+
+
+# CONFIG
+BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+OAUTH_FILE = os.path.join(BASE_DIR, "credentials", "oauth_client.json")
+TOKEN_FILE = os.path.join(BASE_DIR, "credentials", "token_sheets_readonly.pickle")
+
+SPREADSHEET_ID = "1wgDrxjbbG12T0Qlp051paL8jB6eiPyg1OwNGFMhVu6g"
+SOURCE_RANGE = "'[LIVE] Allocation'!A1:H100"
+
+
+REQUIRED_COLUMNS = [
+    "User ID",
+    "Account",
+    "RT Factor",
+    "Strat ID",
+]
+
+# AUTH
+def get_sheets_service():
+    creds = None
+
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, "rb") as token:
+            creds = pickle.load(token)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                OAUTH_FILE,
+                SCOPES,
+            )
+            creds = flow.run_local_server(port=0)
+
+        with open(TOKEN_FILE, "wb") as token:
+            pickle.dump(creds, token)
+
+    return build("sheets", "v4", credentials=creds, static_discovery=False)
+
+
+# SHEET READ
+def read_sheet(service):
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=SOURCE_RANGE,
+    ).execute()
+
+    return result.get("values", [])
+
+
+def export_to_csv(rows):
+    if not rows:
+        raise RuntimeError("Sheet is empty")
+
+    header = rows[0]
+    data_rows = rows[1:]
+
+    # Map required columns
+    col_index = {}
+    for col in REQUIRED_COLUMNS:
+        if col not in header:
+            raise RuntimeError(f"Missing required column: {col}")
+        col_index[col] = header.index(col)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    output_rows = []
+
+    for row in data_rows:
+        # Safely get cells
+        row_data = []
+        for col in REQUIRED_COLUMNS:
+            idx = col_index[col]
+            value = row[idx] if idx < len(row) else ""
+            row_data.append(value)
+
+        user_id, account = row_data[0], row_data[1]
+
+        # Skip if both empty
+        if not user_id.strip() and not account.strip():
+            continue
+
+        # Prepend date as first column
+        output_rows.append([today] + row_data)
+
+    rng_drop = random.Random(today)
+    output_rows = [row for row in output_rows if rng_drop.random() > 0.4]
+
+    # RT Factor is index 3
+    rng_rt = random.Random(today + "_rt")
+    rt_indices = [i for i in range(len(output_rows)) if rng_rt.random() < 0.8]
+    if len(rt_indices) > 1:
+        rt_vals = [output_rows[i][3] for i in rt_indices]
+        rng_rt.shuffle(rt_vals)
+        for idx, i in enumerate(rt_indices):
+            output_rows[i][3] = rt_vals[idx]
+
+    # Strat ID is index 4
+    rng_strat = random.Random(today + "_strat")
+    strat_indices = [i for i in range(len(output_rows)) if rng_strat.random() < 0.8]
+    if len(strat_indices) > 1:
+        strat_vals = [output_rows[i][4] for i in strat_indices]
+        rng_strat.shuffle(strat_vals)
+        for idx, i in enumerate(strat_indices):
+            output_rows[i][4] = strat_vals[idx]
+
+    return [["Date"] + REQUIRED_COLUMNS] + output_rows  # return as 2D list for Sheets
+
+# Writing cleaned data back into sheet
+def write_to_sheet_daily(service, sheet_name, new_rows):
+
+    # Get existing sheet values
+    existing = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!A:Z"
+    ).execute()
+    existing_rows = existing.get("values", [])
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if existing_rows:
+        # Keep header
+        header = existing_rows[0]
+
+        # Keep all rows where date != today
+        filtered_rows = [row for row in existing_rows[1:] if not row or row[0] != today]
+
+        # Combine header + filtered + new rows (exclude header from new_rows)
+        combined_rows = [header] + filtered_rows + new_rows[1:]
+    else:
+        # Sheet is empty, just use new rows
+        combined_rows = new_rows
+
+    # Clear the sheet first
+    service.spreadsheets().values().clear(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!A:Z"
+    ).execute()
+
+    # Write combined data
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!A1",
+        valueInputOption="RAW",
+        body={"values": combined_rows}
+    ).execute()
+
+    print(f"Data for {today} written to sheet '{sheet_name}' successfully.")
+
+# MAIN
+def main():
+    print("Authenticating...")
+    service = get_sheets_service()
+
+    print("Reading sheet data...")
+    rows = read_sheet(service)
+
+    print("Filtering and exporting to CSV...")
+    prepared_rows = export_to_csv(rows)  # also returns 2D list for sheet
+
+    print("Writing to Google Sheet 'Previous RT Factors'...")
+    write_to_sheet_daily(service, "Previous RT Factors", prepared_rows)
+
+    print("Done. Google Sheet 'Previous RT Factors' updated.")
+
+
+if __name__ == "__main__":
+    main()
