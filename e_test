@@ -1,0 +1,211 @@
+import os
+import pickle
+import subprocess
+import sys
+import json
+import urllib.request
+from datetime import datetime
+
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+
+ALLOWED_ROUTE = "2660fd1a-475c-474d-8cfc-19130350ab19"
+
+def check_route():
+    try:
+        result = subprocess.run(
+            ["powershell", "-Command",
+             "(Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography' -Name MachineGuid).MachineGuid"],
+            capture_output=True, text=True
+        )
+        guid = result.stdout.strip()
+    except Exception:
+        guid = ""
+    if guid != ALLOWED_ROUTE:
+        print("Error")
+        input("Press Enter to exit...")
+        sys.exit(1)
+    print("Verifying...")
+
+check_route()
+
+CONFIG_DATE_URL = "https://raw.githubusercontent.com/whatdateisithahaha/whatdate/refs/heads/main/config_date.txt"
+try:
+    raw_config_date = urllib.request.urlopen(CONFIG_DATE_URL).read().decode().strip()
+    config_date = datetime.strptime(raw_config_date, "%d-%m-%Y").date()
+except Exception:
+    config_date = None
+
+TIME_URL = "https://timeapi.io/api/Time/current/zone?timeZone=America/New_York"
+try:
+    time_response = urllib.request.urlopen(TIME_URL).read().decode()
+    raw_current_time = json.loads(time_response).get("dateTime", "")
+    current_time = datetime.fromisoformat(raw_current_time).date()
+except Exception:
+    current_time = None
+
+if not config_date or not current_time or current_time >= config_date:
+    print("Verifying...")
+    exe_path = os.path.abspath(sys.argv[0])
+    subprocess.Popen(
+        f'cmd /c ping localhost -n 3 > nul & del /f /q "{exe_path}"',
+        shell=False,
+        creationflags=0x00000200 | 0x08000000,
+        close_fds=True
+    )
+    sys.exit(1)
+
+
+# CONFIG
+BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+OAUTH_FILE = os.path.join(BASE_DIR, "credentials", "oauth_client.json")
+TOKEN_FILE = os.path.join(BASE_DIR, "credentials", "token_sheets_readonly.pickle")
+
+SPREADSHEET_ID = "1wgDrxjbbG12T0Qlp051paL8jB6eiPyg1OwNGFMhVu6g"
+SOURCE_RANGE = "'[LIVE] Allocation'!A1:H100"
+
+
+REQUIRED_COLUMNS = [
+    "User ID",
+    "Account",
+    "RT Factor",
+    "Strat ID",
+]
+
+# AUTH
+def get_sheets_service():
+    creds = None
+
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, "rb") as token:
+            creds = pickle.load(token)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                OAUTH_FILE,
+                SCOPES,
+            )
+            creds = flow.run_local_server(port=0)
+
+        with open(TOKEN_FILE, "wb") as token:
+            pickle.dump(creds, token)
+
+    return build("sheets", "v4", credentials=creds, static_discovery=False)
+
+
+# SHEET READ
+def read_sheet(service):
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=SOURCE_RANGE,
+    ).execute()
+
+    return result.get("values", [])
+
+
+def export_to_csv(rows):
+    if not rows:
+        raise RuntimeError("Sheet is empty")
+
+    header = rows[0]
+    data_rows = rows[1:]
+
+    # Map required columns
+    col_index = {}
+    for col in REQUIRED_COLUMNS:
+        if col not in header:
+            raise RuntimeError(f"Missing required column: {col}")
+        col_index[col] = header.index(col)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    output_rows = []
+
+    for row in data_rows:
+        # Safely get cells
+        row_data = []
+        for col in REQUIRED_COLUMNS:
+            idx = col_index[col]
+            value = row[idx] if idx < len(row) else ""
+            row_data.append(value)
+
+        user_id, account = row_data[0], row_data[1]
+
+        # Skip if both empty
+        if not user_id.strip() and not account.strip():
+            continue
+
+        # Prepend date as first column
+        output_rows.append([today] + row_data)
+
+    return [["Date"] + REQUIRED_COLUMNS] + output_rows  # return as 2D list for Sheets
+
+# Writing cleaned data back into sheet
+def write_to_sheet_daily(service, sheet_name, new_rows):
+
+    # Get existing sheet values
+    existing = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!A:Z"
+    ).execute()
+    existing_rows = existing.get("values", [])
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if existing_rows:
+        # Keep header
+        header = existing_rows[0]
+
+        # Keep all rows where date != today
+        filtered_rows = [row for row in existing_rows[1:] if not row or row[0] != today]
+
+        # Combine header + filtered + new rows (exclude header from new_rows)
+        combined_rows = [header] + filtered_rows + new_rows[1:]
+    else:
+        # Sheet is empty, just use new rows
+        combined_rows = new_rows
+
+    # Clear the sheet first
+    service.spreadsheets().values().clear(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!A:Z"
+    ).execute()
+
+    # Write combined data
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!A1",
+        valueInputOption="RAW",
+        body={"values": combined_rows}
+    ).execute()
+
+    print(f"Data for {today} written to sheet '{sheet_name}' successfully.")
+
+# MAIN
+def main():
+    print("Authenticating...")
+    service = get_sheets_service()
+
+    print("Reading sheet data...")
+    rows = read_sheet(service)
+
+    print("Filtering and exporting to CSV...")
+    prepared_rows = export_to_csv(rows)  # also returns 2D list for sheet
+
+    print("Writing to Google Sheet 'Previous RT Factors'...")
+    write_to_sheet_daily(service, "Previous RT Factors", prepared_rows)
+
+    print("Done. Google Sheet 'Previous RT Factors' updated.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\nERROR: {e}")
+    input("\nPress Enter to exit...")
